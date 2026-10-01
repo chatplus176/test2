@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Body² Text Scanner</title>
+<style>
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:#fff;color:#111;font-family:Arial,Helvetica,sans-serif;
+    min-height:100vh;
+  }
+  .top{
+    background:#111;color:#d4af37;text-align:center;padding:18px 16px;
+    font-size:24px;font-weight:800;letter-spacing:.5px;
+  }
+  .wrap{max-width:720px;margin:0 auto;padding:16px}
+  .hint{font-size:16px;text-align:center;margin:6px 0 14px;color:#555}
+  .camera{
+    background:#111;border-radius:16px;overflow:hidden;position:relative;
+    aspect-ratio:4/3;display:flex;align-items:center;justify-content:center;
+  }
+  video,.photo{width:100%;height:100%;object-fit:cover;display:block}
+  .status{
+    min-height:28px;text-align:center;margin:12px 0 8px;font-weight:700;
+  }
+  button{
+    width:100%;border:0;border-radius:12px;padding:17px 14px;
+    font-size:20px;font-weight:800;cursor:pointer;margin-top:10px;
+    touch-action:manipulation;
+  }
+  .gold{background:#d4af37;color:#111}
+  .dark{background:#111;color:#fff}
+  .light{background:#eee;color:#111}
+  button:disabled{opacity:.45}
+  .result{
+    margin-top:14px;border:2px solid #111;border-radius:14px;padding:18px;
+    text-align:center;display:none;
+  }
+  .label{font-size:14px;color:#666;font-weight:700;letter-spacing:.8px}
+  .code{font-size:42px;font-weight:900;letter-spacing:3px;margin:8px 0 4px}
+  .raw{font-size:14px;color:#666;word-break:break-word;margin-top:10px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .hidden{display:none!important}
+  .error{color:#b00020;font-weight:700}
+  .small{font-size:13px;color:#666;text-align:center;margin-top:12px;line-height:1.4}
+</style>
+</head>
+<body>
+<div class="top">Body² TEXT SCANNER</div>
+
+<div class="wrap">
+  <div class="hint">Point the <b>BACK CAMERA</b> at the printed code, then take a photo.</div>
+
+  <div class="camera">
+    <video id="video" autoplay playsinline muted></video>
+    <img id="photo" class="photo hidden" alt="Captured image">
+    <canvas id="canvas" class="hidden"></canvas>
+  </div>
+
+  <div id="status" class="status">Camera is ready.</div>
+
+  <button id="startBtn" class="dark">START CAMERA</button>
+  <button id="takeBtn" class="gold" disabled>TAKE PHOTO</button>
+
+  <div id="result" class="result">
+    <div class="label">DETECTED CODE</div>
+    <div id="code" class="code">—</div>
+    <div id="raw" class="raw"></div>
+    <div class="row">
+      <button id="retakeBtn" class="light">RETAKE</button>
+      <button id="useBtn" class="gold">USE CODE</button>
+    </div>
+  </div>
+
+  <button id="stopBtn" class="light hidden">CLOSE CAMERA</button>
+
+  <div class="small">
+    The camera does <b>not</b> continuously scan. One photo is captured and kept on screen while the text is recognised.
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+const video = document.getElementById('video');
+const photo = document.getElementById('photo');
+const canvas = document.getElementById('canvas');
+const startBtn = document.getElementById('startBtn');
+const takeBtn = document.getElementById('takeBtn');
+const stopBtn = document.getElementById('stopBtn');
+const retakeBtn = document.getElementById('retakeBtn');
+const useBtn = document.getElementById('useBtn');
+const statusEl = document.getElementById('status');
+const result = document.getElementById('result');
+const codeEl = document.getElementById('code');
+const rawEl = document.getElementById('raw');
+
+let stream = null;
+let worker = null;
+let lastCode = '';
+
+function status(msg, error=false){
+  statusEl.textContent = msg;
+  statusEl.className = 'status' + (error ? ' error' : '');
+}
+
+async function startCamera(){
+  try{
+    if(stream) return;
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},
+      audio:false
+    });
+    video.classList.remove('hidden');
+    photo.classList.add('hidden');
+    video.srcObject = stream;
+    await video.play();
+    startBtn.classList.add('hidden');
+    takeBtn.disabled = false;
+    stopBtn.classList.remove('hidden');
+    result.style.display='none';
+    status('Camera ready — frame the sticker and tap TAKE PHOTO.');
+  }catch(e){
+    status('Camera could not open. Check camera permission and use HTTPS.',true);
+  }
+}
+
+function stopCamera(){
+  if(stream){
+    stream.getTracks().forEach(t=>t.stop());
+    stream=null;
+  }
+  video.srcObject=null;
+  takeBtn.disabled=true;
+  stopBtn.classList.add('hidden');
+  startBtn.classList.remove('hidden');
+  status('Camera closed.');
+}
+
+function cleanText(s){
+  return (s||'').toUpperCase().replace(/[^A-Z0-9]/g,' ');
+}
+
+function chooseCode(text){
+  const cleaned=cleanText(text);
+  const tokens=cleaned.match(/[A-Z0-9]{2,12}/g)||[];
+  if(!tokens.length) return '';
+  // Prefer tokens containing both letters and numbers, which fits codes like H200/D001.
+  const mixed=tokens.filter(t=>/[A-Z]/.test(t)&&/[0-9]/.test(t));
+  if(mixed.length) return mixed.sort((a,b)=>b.length-a.length)[0];
+  return tokens.sort((a,b)=>b.length-a.length)[0];
+}
+
+async function getWorker(){
+  if(worker) return worker;
+  status('Preparing text recognition…');
+  worker = await Tesseract.createWorker('eng', 1, {
+    logger:m => {
+      if(m.status && typeof m.progress==='number'){
+        const p=Math.round(m.progress*100);
+        status('Reading photo… ' + p + '%');
+      }
+    }
+  });
+  await worker.setParameters({
+    tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+    tessedit_pageseg_mode:'11'
+  });
+  return worker;
+}
+
+function makeProcessedImage(){
+  const w=canvas.width, h=canvas.height;
+  const c=document.createElement('canvas');
+  c.width=w*2;c.height=h*2;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(canvas,0,0,c.width,c.height);
+  const img=ctx.getImageData(0,0,c.width,c.height);
+  const d=img.data;
+  for(let i=0;i<d.length;i+=4){
+    let y=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+    // Contrast + threshold, while retaining black text on white paper.
+    y=(y-128)*1.8+128;
+    y=Math.max(0,Math.min(255,y));
+    d[i]=d[i+1]=d[i+2]=y;
+  }
+  ctx.putImageData(img,0,0);
+  return c;
+}
+
+async function takePhoto(){
+  if(!stream || !video.videoWidth) return;
+
+  takeBtn.disabled=true;
+  startBtn.disabled=true;
+  result.style.display='none';
+
+  canvas.width=video.videoWidth;
+  canvas.height=video.videoHeight;
+  const ctx=canvas.getContext('2d');
+  // The camera is displayed mirrored only by the device preview; capture the normal rear-camera frame.
+  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+
+  photo.src=canvas.toDataURL('image/jpeg',0.95);
+  photo.classList.remove('hidden');
+  video.classList.add('hidden');
+
+  // Stop live camera immediately. The captured image remains frozen.
+  if(stream){
+    stream.getTracks().forEach(t=>t.stop());
+    stream=null;
+  }
+
+  status('Photo captured. Reading the photo — you can move the sticker away now.');
+
+  try{
+    const w=await getWorker();
+    const processed=makeProcessedImage();
+    const r=await w.recognize(processed);
+    const raw=(r.data.text||'').trim();
+    let detected=chooseCode(raw);
+
+    // One fallback pass on the original photo if preprocessing found nothing.
+    if(!detected){
+      status('Trying the original photo…');
+      const r2=await w.recognize(canvas);
+      const raw2=(r2.data.text||'').trim();
+      rawEl.textContent='OCR: '+(raw2||'No text detected');
+      detected=chooseCode(raw2);
+      if(raw2) lastCode=detected;
+    }else{
+      lastCode=detected;
+      rawEl.textContent='OCR: '+(raw||'No text detected');
+    }
+
+    codeEl.textContent=detected || 'NOT FOUND';
+    result.style.display='block';
+    if(detected){
+      status('Code found. Check it, then tap USE CODE.');
+    }else{
+      status('No clear code found. Tap RETAKE and move closer / improve lighting.',true);
+    }
+  }catch(e){
+    console.error(e);
+    status('Text recognition failed. Tap RETAKE and try again.',true);
+    result.style.display='block';
+    codeEl.textContent='ERROR';
+  }finally{
+    startBtn.disabled=false;
+  }
+}
+
+function retake(){
+  result.style.display='none';
+  photo.classList.add('hidden');
+  video.classList.remove('hidden');
+  startCamera();
+}
+
+useBtn.addEventListener('click',()=>{
+  if(!lastCode) return;
+  // Easy integration point for the Body² stock/sales site.
+  // For this standalone test, copy the recognised code.
+  navigator.clipboard?.writeText(lastCode).catch(()=>{});
+  status('Code '+lastCode+' selected and copied. The main Body² site can use this value.');
+});
+
+startBtn.addEventListener('click',startCamera);
+takeBtn.addEventListener('click',takePhoto);
+stopBtn.addEventListener('click',stopCamera);
+retakeBtn.addEventListener('click',retake);
+
+window.addEventListener('pagehide',stopCamera);
+</script>
+</body>
+</html>
